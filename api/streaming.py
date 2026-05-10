@@ -22,10 +22,12 @@ logger = logging.getLogger(__name__)
 from api.config import (
     STREAMS, STREAMS_LOCK, CANCEL_FLAGS, AGENT_INSTANCES, STREAM_PARTIAL_TEXT,
     STREAM_REASONING_TEXT, STREAM_LIVE_TOOL_CALLS,
+    STREAM_GOAL_RELATED, PENDING_GOAL_CONTINUATION,
     LOCK, SESSIONS, SESSION_DIR,
     _get_session_agent_lock, _set_thread_env, _clear_thread_env,
     SESSION_AGENT_LOCKS, SESSION_AGENT_LOCKS_LOCK,
     resolve_model_provider,
+    resolve_custom_provider_connection,
     model_with_provider_context,
 )
 from api.helpers import redact_session_data, _redact_text
@@ -430,15 +432,58 @@ def _is_valid_image(path: Path, mime: str) -> bool:
     return False
 
 
-def _build_native_multimodal_message(workspace_ctx: str, msg_text: str, attachments, workspace: str):
+def _resolve_image_input_mode(cfg: dict) -> str:
+    """Return ``"native"`` or ``"text"`` based on config, mirroring
+    ``agent/image_routing.py:decide_image_input_mode``.
+
+    The agent has this logic, but the WebUI's ``_build_native_multimodal_message``
+    was unconditionally embedding images as native ``image_url`` parts, completely
+    bypassing ``image_input_mode``.  This caused silent failures when the main model
+    does not support images and the fallback model is also text-only (#21160-related).
+    """
+    agent_cfg = cfg.get("agent") or {}
+    mode = str(agent_cfg.get("image_input_mode", "auto") or "auto").strip().lower()
+    if mode not in ("auto", "native", "text"):
+        mode = "auto"
+
+    if mode == "native":
+        return "native"
+    if mode == "text":
+        return "text"
+
+    # auto: if auxiliary.vision is explicitly configured → text mode
+    # (user opted into a dedicated vision backend)
+    aux = cfg.get("auxiliary") or {}
+    vision = aux.get("vision") or {}
+    provider = str(vision.get("provider") or "").strip().lower()
+    model_name = str(vision.get("model") or "").strip()
+    base_url = str(vision.get("base_url") or "").strip()
+    if provider not in ("", "auto") or model_name or base_url:
+        return "text"
+
+    # No explicit vision config, no model-capability lookup available in WebUI.
+    # Default to native — the agent's ``_strip_images_from_messages`` guard will
+    # strip images on rejection and retry as text.
+    return "native"
+
+
+def _build_native_multimodal_message(workspace_ctx: str, msg_text: str, attachments, workspace: str, *, cfg: dict = None):
     """Build native multimodal content parts for current-turn image uploads.
 
     WebUI uploads files into the active workspace. For image files, pass the
     bytes to Hermes as OpenAI-style image_url data URLs so vision-capable main
     models can consume them in the same request. Non-image files intentionally
     stay as text path attachments so the agent can inspect them with file tools.
+
+    When *cfg* is provided, respects ``agent.image_input_mode`` — if the resolved
+    mode is ``"text"``, returns a plain string (attachments are not embedded) so
+    the agent's text-mode pipeline (``vision_analyze``) handles images.
     """
     if not attachments:
+        return workspace_ctx + msg_text
+
+    # ── Check image_input_mode before embedding anything ──
+    if cfg is not None and _resolve_image_input_mode(cfg) == "text":
         return workspace_ctx + msg_text
 
     parts = [{'type': 'text', 'text': workspace_ctx + msg_text}]
@@ -586,9 +631,25 @@ def _message_text(value) -> str:
     return _strip_thinking_markup(str(value or '').strip())
 
 
-def _strip_workspace_prefix(text: str) -> str:
-    """Remove WebUI's model-facing workspace tag from display identity text."""
-    return re.sub(r'^\s*\[Workspace:[^\]]+\]\s*', '', str(text or '')).strip()
+_WORKSPACE_PREFIX_RE = re.compile(r'^\s*\[Workspace::v1:\s*(?:\\.|[^\]\\])+\]\s*')
+_LEGACY_WORKSPACE_PREFIX_RE = re.compile(r'^\s*\[Workspace:[^\]]+\]\s*')
+
+
+def _escape_workspace_prefix_path(path: str) -> str:
+    return str(path or '').replace('\\', '\\\\').replace(']', '\\]')
+
+
+def _workspace_context_prefix(path: str) -> str:
+    return f"[Workspace::v1: {_escape_workspace_prefix_path(path)}]\n"
+
+
+def _strip_workspace_prefix(text: str, *, include_legacy: bool = False) -> str:
+    """Remove WebUI-injected workspace tags without eating user-typed text."""
+    value = str(text or '')
+    stripped = _WORKSPACE_PREFIX_RE.sub('', value, count=1)
+    if include_legacy and stripped == value:
+        stripped = _LEGACY_WORKSPACE_PREFIX_RE.sub('', value, count=1)
+    return stripped.strip()
 
 
 def _first_exchange_snippets(messages):
@@ -1051,7 +1112,7 @@ def _fallback_title_from_exchange(user_text: str, assistant_text: str) -> Option
     assistant_text = _strip_thinking_markup(assistant_text or '').strip()
     if not user_text:
         return None
-    user_text = re.sub(r'^\[Workspace:[^\]]+\]\s*', '', user_text)
+    user_text = _strip_workspace_prefix(user_text)
     user_text = re.sub(r'\s+', ' ', user_text).strip()
     assistant_text = re.sub(r'\s+', ' ', assistant_text).strip()
     combined = f"{user_text} {assistant_text}".strip().lower()
@@ -1443,7 +1504,7 @@ def _message_identity(msg):
         # visible optimistic bubble contains only the human text. Treat them as
         # the same turn for merge/dedup purposes; otherwise compaction results
         # render two adjacent user bubbles ("Ok" and "[Workspace...]\nOk").
-        text = _strip_workspace_prefix(text)
+        text = _strip_workspace_prefix(text, include_legacy=True)
     if not text and not msg.get('tool_call_id') and not msg.get('tool_calls'):
         return None
     return (
@@ -1482,7 +1543,12 @@ def _find_current_user_turn(messages, msg_text):
         if not isinstance(msg, dict) or msg.get('role') != 'user':
             continue
         fallback = idx
-        text = " ".join(_strip_workspace_prefix(_message_text(msg.get('content', ''))).split())
+        text = " ".join(
+            _strip_workspace_prefix(
+                _message_text(msg.get('content', '')),
+                include_legacy=True,
+            ).split()
+        )
         if needle and (needle in text or text in needle):
             return idx
     return fallback
@@ -1835,6 +1901,7 @@ def _run_agent_streaming(
     *,
     ephemeral=False,
     model_provider=None,
+    goal_related=False,
 ):
     """Run agent in background thread, writing SSE events to STREAMS[stream_id].
 
@@ -1852,15 +1919,10 @@ def _run_agent_streaming(
     old_hermes_home = None
     old_profile_env = {}
 
-    # ── MCP Server Discovery (lazy import, idempotent) ──
-    # discover_mcp_tools() is called here (rather than at server startup) so that
-    # the hermes-agent package is fully initialized before we try to connect.
-    # It is safe to call multiple times — already-connected servers are skipped.
-    try:
-        from tools.mcp_tool import discover_mcp_tools
-        discover_mcp_tools()
-    except Exception:
-        pass  # MCP not available or not configured — non-fatal
+    # MCP discovery moved to AFTER the per-profile HERMES_HOME mutation below
+    # (was here at v0.51.30) — the previous placement always read the default
+    # profile's mcp_servers because os.environ['HERMES_HOME'] hadn't been
+    # rewritten yet.  See https://github.com/nesquena/hermes-webui/issues/1968.
 
     # Sprint 10: create a cancel event for this stream
     cancel_event = threading.Event()
@@ -1985,6 +2047,27 @@ def _run_agent_streaming(
             if _profile_home:
                 os.environ['HERMES_HOME'] = _profile_home
         # Lock released — agent runs without holding it
+        # ── MCP Server Discovery (lazy import, idempotent) ──
+        # MUST run AFTER the HERMES_HOME mutation above — `discover_mcp_tools()`
+        # reads `~/.hermes/config.yaml` via `get_hermes_home()`, which uses
+        # `os.environ['HERMES_HOME']`.  Calling it before the mutation always
+        # loaded the default profile's `mcp_servers`, even when the session
+        # was stamped with a non-default profile.  See issue #1968.
+        #
+        # NOTE: `_servers` in `tools/mcp_tool.py` is a process-global registry
+        # keyed by server name.  This means once profile A registers a server
+        # named e.g. `postgres`, profile B's discovery sees it as already
+        # connected and skips it — even if B's config points at a different
+        # binary.  Fully fixing multi-profile concurrent use requires keying
+        # `_servers` by `(profile_home, name)` upstream in hermes-agent; that
+        # lives outside this WebUI repo.  This change fixes the headline bug
+        # for users who run a single non-default profile per WebUI process.
+        try:
+            from tools.mcp_tool import discover_mcp_tools
+            discover_mcp_tools()
+        except Exception:
+            pass  # MCP not available or not configured — non-fatal
+
         # Register a gateway-style notify callback so the approval system can
         # push the `approval` SSE event the moment a dangerous command is
         # detected, without waiting for the next on_tool() poll cycle.
@@ -2266,6 +2349,16 @@ def _run_agent_streaming(
             except Exception as _e:
                 print(f"[webui] WARNING: resolve_runtime_provider failed: {_e}", flush=True)
 
+            # Named custom providers (custom:slug) may not be resolvable by
+            # hermes_cli.runtime_provider directly. Fall back to config.yaml
+            # custom_providers[] so WebUI can pass explicit creds/base_url.
+            if isinstance(resolved_provider, str) and resolved_provider.startswith("custom:"):
+                _cp_key, _cp_base = resolve_custom_provider_connection(resolved_provider)
+                if not resolved_api_key and _cp_key:
+                    resolved_api_key = _cp_key
+                if not resolved_base_url and _cp_base:
+                    resolved_base_url = _cp_base
+
             # Read per-profile config at call time (not module-level snapshot)
             from api.config import get_config as _get_config
             _cfg = _get_config()
@@ -2534,15 +2627,15 @@ def _run_agent_streaming(
 
             # Prepend workspace context so the agent always knows which directory
             # to use for file operations, regardless of session age or AGENTS.md defaults.
-            workspace_ctx = f"[Workspace: {s.workspace}]\n"
+            workspace_ctx = _workspace_context_prefix(str(s.workspace))
             workspace_system_msg = (
                 f"Active workspace at session start: {s.workspace}\n"
-                "Every user message is prefixed with [Workspace: /absolute/path] indicating the "
+                "Every user message is prefixed with [Workspace::v1: /absolute/path] indicating the "
                 "workspace the user has selected in the web UI at the time they sent that message. "
                 "This tag is the single authoritative source of the active workspace and updates "
                 "with every message. It overrides any prior workspace mentioned in this system "
                 "prompt, memory, or conversation history. Always use the value from the most recent "
-                "[Workspace: ...] tag as your default working directory for ALL file operations: "
+                "[Workspace::v1: ...] tag as your default working directory for ALL file operations: "
                 "write_file, read_file, search_files, terminal workdir, and patch. "
                 "Never fall back to a hardcoded path when this tag is present."
             )
@@ -2622,7 +2715,7 @@ def _run_agent_streaming(
             )
             _ckpt_thread.start()
 
-            user_message = _build_native_multimodal_message(workspace_ctx, msg_text, attachments, workspace)
+            user_message = _build_native_multimodal_message(workspace_ctx, msg_text, attachments, workspace, cfg=_cfg)
             result = agent.run_conversation(
                 user_message=user_message,
                 system_message=workspace_system_msg,
@@ -2725,6 +2818,12 @@ def _run_agent_streaming(
                                 resolved_provider = _heal_rt.get('provider')
                             if not resolved_base_url:
                                 resolved_base_url = _heal_rt.get('base_url')
+                            if isinstance(resolved_provider, str) and resolved_provider.startswith('custom:'):
+                                _cp_key, _cp_base = resolve_custom_provider_connection(resolved_provider)
+                                if not resolved_api_key and _cp_key:
+                                    resolved_api_key = _cp_key
+                                if not resolved_base_url and _cp_base:
+                                    resolved_base_url = _cp_base
                             # Rebuild agent kwargs and create a fresh agent
                             _agent_kwargs['api_key'] = resolved_api_key
                             _agent_kwargs['base_url'] = resolved_base_url
@@ -3189,6 +3288,69 @@ def _run_agent_streaming(
                     })
             except Exception:
                 logger.debug("Failed to drain pending steer for session %s", session_id)
+            # /goal parity: after a successful assistant turn, run the Hermes
+            # GoalManager judge before terminal done/stream_end events. The
+            # frontend surfaces the status line and queues continuation_prompt as
+            # a normal next user message so /queue and user input keep priority.
+            # #1932: only evaluate when the turn was goal-related (set via
+            # STREAM_GOAL_RELATED or goal_related parameter).
+            try:
+                from api.goals import evaluate_goal_after_turn, has_active_goal
+
+                if not goal_related or not has_active_goal(session_id, profile_home=_profile_home):
+                    _goal_decision = {}
+                else:
+                    _last_goal_response = ''
+                    for _goal_msg in reversed(s.messages or []):
+                        if not isinstance(_goal_msg, dict) or _goal_msg.get('role') != 'assistant':
+                            continue
+                        _goal_content = _goal_msg.get('content', '')
+                        if isinstance(_goal_content, list):
+                            _goal_parts = []
+                            for _goal_part in _goal_content:
+                                if isinstance(_goal_part, dict):
+                                    _goal_text = _goal_part.get('text') or _goal_part.get('content')
+                                    if _goal_text:
+                                        _goal_parts.append(str(_goal_text))
+                            _last_goal_response = '\n'.join(_goal_parts)
+                        else:
+                            _last_goal_response = str(_goal_content or '')
+                        break
+                    put('goal', {
+                        'session_id': session_id,
+                        'state': 'evaluating',
+                        'message': 'Evaluating goal progress…',
+                    })
+                    _goal_decision = evaluate_goal_after_turn(
+                        session_id,
+                        _last_goal_response,
+                        user_initiated=True,
+                        profile_home=_profile_home,
+                    )
+                decision = _goal_decision or {}
+                _goal_message = str(decision.get('message') or '').strip()
+                if _goal_message:
+                    put('goal', {
+                        'session_id': session_id,
+                        'state': 'continuing' if decision.get('should_continue') else 'idle',
+                        'message': _goal_message,
+                        'decision': decision,
+                    })
+                if decision.get('should_continue'):
+                    continuation_prompt = str(decision.get('continuation_prompt') or '').strip()
+                    if continuation_prompt:
+                        # #1932: mark this session as pending a goal continuation
+                        # so the next /chat/start creates a goal-related stream.
+                        PENDING_GOAL_CONTINUATION.add(session_id)
+                        put('goal_continue', {
+                            'session_id': session_id,
+                            'continuation_prompt': continuation_prompt,
+                            'text': continuation_prompt,
+                            'message': _goal_message,
+                            'decision': decision,
+                        })
+            except Exception as _goal_exc:
+                logger.debug("Goal continuation hook failed for session %s: %s", session_id, _goal_exc)
             raw_session = s.compact() | {'messages': s.messages, 'tool_calls': tool_calls}
             put('done', {'session': redact_session_data(raw_session), 'usage': usage})
             # Emit one last metering packet for the live message-header TPS label.
@@ -3284,6 +3446,12 @@ def _run_agent_streaming(
                         resolved_provider = _heal_rt.get('provider')
                     if not resolved_base_url:
                         resolved_base_url = _heal_rt.get('base_url')
+                    if isinstance(resolved_provider, str) and resolved_provider.startswith('custom:'):
+                        _cp_key, _cp_base = resolve_custom_provider_connection(resolved_provider)
+                        if not resolved_api_key and _cp_key:
+                            resolved_api_key = _cp_key
+                        if not resolved_base_url and _cp_base:
+                            resolved_base_url = _cp_base
                     # Build a fresh agent with the new credentials
                     _heal_kwargs = dict(_agent_kwargs) if '_agent_kwargs' in dir() else {}
                     _heal_kwargs['api_key'] = resolved_api_key
@@ -3397,6 +3565,16 @@ def _run_agent_streaming(
             STREAM_PARTIAL_TEXT.pop(stream_id, None)  # Clean up partial text buffer (#893)
             STREAM_REASONING_TEXT.pop(stream_id, None)  # Clean up reasoning trace (#1361 §A)
             STREAM_LIVE_TOOL_CALLS.pop(stream_id, None)  # Clean up tool calls (#1361 §B)
+            STREAM_GOAL_RELATED.pop(stream_id, None)  # Clean up goal-related flag (#1932)
+            # NOTE: do NOT discard PENDING_GOAL_CONTINUATION here. The marker
+            # is set by goal_continue (line ~3328) inside the SAME function
+            # call and consumed atomically by `_start_chat_stream_for_session`
+            # in routes.py (around line 6522) when the next stream starts.
+            # Discarding here in the streaming worker's `finally` would
+            # almost always race ahead of the frontend's SSE-receive →
+            # POST /api/chat/start round-trip and erase the marker before
+            # the next stream can read it, breaking the goal-continuation
+            # chain. Stage-326 critical fix per Opus advisor review.
 
 # ============================================================
 # SECTION: HTTP Request Handler

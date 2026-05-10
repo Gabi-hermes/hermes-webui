@@ -1,5 +1,262 @@
 # Hermes Web UI -- Changelog
 
+## [v0.51.34] — 2026-05-09 — Release J (kanban edit/dispatch + zh-Hant kanban i18n)
+
+### Added
+
+- **PR #1981** by @nesquena-hermes — Three connected Kanban-UX fixes that were load-bearing for the actual work-queue lifecycle:
+
+  - **Edit task** — new `.kanban-edit-btn` on the detail-view header opens the existing `#kanbanTaskModal` pre-filled from a fresh server fetch. Submit branches POST→PATCH for edit mode. Backend already supported `_patch_task` at `api/kanban_bridge.py:338-424`; pure UI gap closed.
+  - **Run dispatcher** — new `runKanbanDispatcher()` posts `/api/kanban/dispatch` WITHOUT `dry_run=1` after a `showConfirmDialog`. Two UI surfaces: lightning-bolt button in the board header and primary "Run dispatcher" button in the sidebar bulk bar. `_kanbanFormatDispatchResult()` produces concrete summaries (`Dispatched: 1 spawned, 2 skipped (no assignee)`) instead of a generic OK toast. Existing `nudgeKanbanDispatcher()` preserved as the dry-run preview path.
+  - **Assignee dropdown** — `<input list>` → `<select>` populated from `/api/profiles` (Hermes profile names) + historical board assignees (under `<optgroup label="Other">`) + explicit "— Unassigned (won't auto-run) —" option. Helper text under the field explains the dispatcher claim contract. Soft warning if the user picks Ready + Unassigned (proceeds on second submit).
+
+  Side effect: default new-task status changed from `triage` → `ready` so the dispatcher actually picks up newly created tasks without an extra status change. Improvements to `.kanban-modal-error` styling benefit the existing create-board modal too.
+
+  **Stage-328 hotfix per nesquena's pre-merge review:** caught a destructive edit-mode regression — opening Edit on a `running`/`blocked`/`done`/`archived` task and saving without changing the status would silently demote the task to `triage` (because `_kanbanEditableStatusFor()` maps non-editable originals to `'triage'` for the dropdown display, and `submitKanbanTaskModal()` was unconditionally including the dropdown value in the PATCH payload). Fixed in commit `8e0eedd1` by introducing a module-scoped `_kanbanTaskModalInitialDisplayedStatus` tracker that records the dropdown value at modal open; the submit path only includes `status` when the user has actually changed it from the displayed value. Added `tests/test_kanban_ui_static.py::test_kanban_edit_mode_preserves_status_when_dropdown_untouched` pinning the invariant.
+
+  19 new i18n keys × 8 locales = 152 entries (zh-Hant added in stage augmentation, see below). 4 new regression tests.
+
+  Closes #1982.
+
+### Fixed
+
+- **PR #1979** by @Michaelyklam — Backfilled the previously-empty zh-Hant kanban locale block in `static/i18n.js`. The Traditional Chinese locale never had Kanban keys at all, so Traditional Chinese users saw English fallbacks for every Kanban label since the panel shipped. Now zh-Hant has 68 kanban keys at parity with the other 7 supported locales (en/ja/ru/es/de/zh/pt/ko). Closes #1972.
+
+  **Stage augmentation (`3fbecc48`):** when #1981 added 17 NEW kanban keys for the edit/run/assignee work, those went into the 8 existing kanban-supporting locales but missed zh-Hant again (since #1981 was authored before #1979 landed). Stage-328 added a maintainer commit backfilling the 17 new keys into zh-Hant with Traditional Chinese translations adapted from the Simplified Chinese (zh) versions. Result: every locale now has the same 85 kanban keys — zero gap.
+
+### Tests
+
+5043 → **5049 collected, 5049 passing, 0 regressions** (+6 net new from #1981's 4 + nesquena's status-preservation regression + the augmentation parity guard). Full suite ~145 s on Python 3.11 (HERMES_HOME isolated). One known-flake (`test_parallel_session_switch.py::TestGitInfoParallel::test_parallel_faster_than_serial` — timing benchmark that re-passes 3/3 in isolation, see existing flake history).
+
+### Pre-release verification
+
+- Full pytest under `HERMES_HOME` isolation: **5049 passed, 8 skipped, 1 xfailed, 2 xpassed** in 145.20 s; one timing-flake re-passes in isolation.
+- JS syntax check (`node -c`) clean on `static/i18n.js` + `static/panels.js` (the 2 modified static files).
+- Conflict-marker scan: clean.
+- Silent-revert check: per-file additions match between contributor branches and stage HEAD.
+- Independent reviews: nesquena APPROVED on #1981 with end-to-end audit; #1979 qualifies for self-review per project policy (i18n.js only, CI green on 3.11/3.12/3.13).
+- Opus advisor: SHIP-WITH-FIXES (all required code-correctness items pass; the "fixes" were CHANGELOG entries to add — applied here).
+
+### Follow-up items filed (non-blocking)
+
+Three nice-to-have polish items called out by Opus that don't block this release:
+
+- **`_kanbanIsDispatching` flag** to disable the Run/Preview buttons during in-flight POST (current double-click path is benign — atomic `claim_task` server-side prevents destructive double-spawn — but produces a "0 spawned" second toast).
+- **Profile-cache invalidation hook** for `_kanbanProfileNamesCache` so profile create/delete from elsewhere in the WebUI propagates without a reload. Current behavior is graceful degradation (orphaned-profile assignee → dispatcher logs `skipped_nonspawnable`, user can re-edit).
+- **Status-display hint** near the modal status `<select>` for non-editable original states (running/blocked/done/archived → mapped to `triage` in the dropdown). The tracker fix makes untouched-submit harmless, but a small visual hint like "(real status: running)" would reduce user confusion.
+
+## [Unreleased]
+
+### Fixed
+
+- **bug(profile/mcp): non-default profile MCP servers never load** ([#1968](https://github.com/nesquena/hermes-webui/issues/1968)). `_run_agent_streaming` called `discover_mcp_tools()` ~100 lines BEFORE the per-session `os.environ['HERMES_HOME'] = _profile_home` mutation, so MCP discovery always read the default profile's `~/.hermes/config.yaml` regardless of which profile the session was stamped with. Result: switching profiles in the WebUI dropdown was effectively cosmetic for MCP — non-default profiles never registered their stdio (npx/node) MCP servers. Fix relocates the `discover_mcp_tools()` call past the `_ENV_LOCK` env-mutation block so `get_hermes_home()` resolves to the session's actual profile home. Adds 4 static regression tests (`tests/test_issue1968_mcp_profile_discovery.py`) pinning the call ordering, lock-release placement, single call site, and try/except wrapping. **Caveat (out of scope, agent-side):** `_servers` in `tools/mcp_tool.py` is a process-global dict keyed only by server name, so concurrent use of multiple non-default profiles in the same WebUI process still has a "first profile wins per name" issue. Fully fixing that requires keying `_servers` by `(profile_home, name)` upstream in hermes-agent. This PR ships layer 1 only.
+
+## [v0.51.31] — 2026-05-09 — Release H (12-PR contributor batch: image-mode + race fixes + composer drafts + locale parity)
+
+### Added
+
+- **PR #1956** by @JKJameson — Persistent composer draft. The chat composer textarea (`#msg`) is now persisted per-session server-side under `Session.composer_draft = {text, files}`, so drafts survive page refreshes and sync across clients. New `POST/GET /api/session/draft` endpoints (input validation: text clamped to 50 KB, files clamped to 50 entries, types coerced to str/list — Stage-326 hardening per Opus advisor). Frontend: 400 ms debounced auto-save on textarea `input`, immediate fire-and-forget save before session switch, save on clarification card lock. `_restoreComposerDraft` guards against stale responses from rapid session switching. Co-authored by Minimax.
+
+- **PR #1957** by @hermes-gimmethebeans — Configurable session TTL. New `_resolve_session_ttl()` helper with three-layer precedence: `HERMES_WEBUI_SESSION_TTL` env var > `settings.json` `session_ttl_seconds` > 30-day default. Out-of-range values [60s, 1y] fall through to the default. Resolved dynamically at every `create_session()` and `set_auth_cookie()` call so settings changes take effect immediately without restart. The `SESSION_TTL = 86400 * 30` module constant is preserved as the named fallback (Stage-326 reconciliation: existing regression tests pin the constant; #1957 originally deleted it). Closes #1954.
+
+### Fixed
+
+- **PR #1939** by @ai-ag2026 — Test-only follow-up: tightens the theme-color bridge tests so the pre-paint script must update every theme-color meta tag and remove stale media attributes; asserts the runtime theme sync updates both the canonical id tag and fallback theme-color tags; adds regression coverage that service-worker shell assets use network-first with cache fallback.
+
+- **PR #1941** by @ai-ag2026 — Preserve chat scroll across final render. When a stream completed, the `done` handler replaced the live transcript with persisted session messages via `renderMessages({ preserveScroll: true })`. The `preserveScroll` path avoided forcing bottom-scroll, but did not preserve `scrollTop` itself; during the DOM rebuild the browser could reset `#messages.scrollTop` to `0`, sending a reader who had scrolled up to the first message. Now captures the scroll position before the rebuild and restores it for unpinned readers; pinned/near-bottom readers keep the existing bottom-follow behavior.
+
+- **PR #1945** by @franksong2702 — Localized the six session-jump-button keys (Start/End labels, aria labels, Appearance setting copy) for ja/ru/es/de/zh/zh-Hant/pt/ko. The opt-in `session_jump_buttons` setting in #1928 (Release G) had English fallbacks in non-English locale blocks; this completes the parity. Strengthened the regression test so future changes cannot leave English literals in non-English locales. Closes #1938.
+
+- **PR #1947** by @happy5318 — Show the same model from different named custom providers in the dropdown instead of silently dropping the second provider's entry. The `_seen_custom_ids` global bucket in `get_available_models()` was seeded from `auto_detected_models` and used a bare model id as the dedup key, so a second named provider exposing the same model id (e.g. both `baidu` and `huoshan` exposing `glm-5.1`) had its entry dropped. Switched the dedup key to `f"{slug}:{model_id}"` so each provider's models track independently. Maintainer-augmented with a regression test (`test_pr1947_same_model_multiple_custom_providers.py`) that fails on master and passes on the fix. Co-authored by @hacker1e7 (independently filed #1874 with broader scope; closed in favor of the narrower fix).
+
+- **PR #1949** by @Sanjays2402 — Closes the v0.51.30 regression race between endless-scroll prefetch and Start-jump's `_ensureAllMessagesLoaded` (Issue #1937). With both opt-ins ON, an in-flight `_loadOlderMessages` racing with `jumpToSessionStart → _ensureAllMessagesLoaded` could prepend a duplicate page if the prefetch resolved last. The naive same-flag-check approach (proposed in #1942 and #1962, both closed in favor of this PR) is a no-op for the post-await race because the prefetch has already cleared the entry-gate. The actual fix is a generation-token + mutex pair: (1) `_loadOlderMessages` snapshots a module-scoped `_messagesGeneration` counter before its `await api(...)` and re-checks it after, aborting the prepend cleanly if any wholesale-replace bumped the token mid-flight; (2) `_ensureAllMessagesLoaded` claims the `_loadingOlder` mutex, bumps the generation token before mutating `S.messages`, yields until any in-flight prefetch's `finally` releases the mutex, then claims the mutex itself. Also adds same-session and `_loadingSessionId` guards that the original ensure-all body was missing post-await. 12 new regression tests pin the wait → lock → fetch → mutate → unlock invariant. Co-authored by @franksong2702 and @Michaelyklam (parallel-discovery PRs). Closes #1937.
+
+- **PR #1950** by @franksong2702 — Mute stale stopped gateway heartbeat. When the root `gateway_state.json` had `gateway_state == "stopped"` and was older than the freshness threshold, the existing logic still treated it as a configured-but-down gateway, surfacing a persistent heartbeat-down alert for users running only profile-scoped gateways. New stale-stopped helper in `api/agent_health.py` reports `alive: null` with reason `gateway_stale_stopped_state` instead of `alive: false`. Fresh stopped states still report down (so a recently stopped configured root gateway continues to surface as an outage), and stale `gateway_state == "running"` still reports down (preserving the #1879 false-positive guard). Closes #1944.
+
+- **PR #1951** by @amlyczz — Gate the goal evaluation hook on goal-related turns only (Issue #1932). Pre-fix, `evaluate_goal_after_turn()` fired on every completed assistant turn when a goal was active, including unrelated user messages — burning the goal budget, triggering continuation prompts that interrupted unrelated conversations, and making `/goal status` numbers misleading. Added `STREAM_GOAL_RELATED` (dict) + `PENDING_GOAL_CONTINUATION` (set) flags in `api.config`; `_run_agent_streaming` accepts a `goal_related=False` kwarg and skips the goal evaluation section when not goal-related; `goal_continue` adds the session to `PENDING_GOAL_CONTINUATION` so the next stream is auto-marked; routes propagate the flag and the `/api/goal` kickoff path passes `goal_related=True`. Co-authored by @franksong2702 (parallel #1946 closed in favor of this PR's broader test coverage). Closes #1932. Stage-326 hotfix per Opus advisor: removed `PENDING_GOAL_CONTINUATION.discard(session_id)` from the streaming worker's `finally` block — that race-erased the marker before the consumer in `routes.py` could read it; the consumer already discards atomically on read. 5 new regression guards pin the corrected ordering.
+
+- **PR #1953** by @lucky-yonug — Skip the `#1776` provider-peel for custom host:port slugs. `model_with_provider_context` can emit `@custom:<host>:<port>:<model>` when the model provider is derived from an OpenAI `base_url` authority (e.g. `custom:10.8.0.1:8080`). The existing colon-count heuristic mistook those extra colons for an over-split model id and prepended the port segment onto the bare model (`8080:Qwen3-235B`), breaking WebUI while CLI/curl stayed correct. Now detects endpoint-style slugs (IPv4 / localhost / dotted-hostname + numeric port) and skips the peel in that case. References #1776.
+
+- **PR #1960** by @Michaelyklam — Translate the `workspace_show_hidden_files` label for ja/ru/es/de/zh/zh-Hant/pt/ko, replacing the English fallbacks in seven non-English locales. Closes #1841.
+
+- **PR #1961** by @sbe27 — WebUI now respects `image_input_mode` instead of unconditionally embedding native `image_url` parts. `_build_native_multimodal_message()` was bypassing the agent's `image_input_mode` config, causing silent turn failures with non-vision models or text-only fallbacks. Added `_resolve_image_input_mode(cfg)` mirroring `decide_image_input_mode()` and wired into the multimodal message builder; when mode resolves to `"text"`, returns a plain string so `vision_analyze` handles images instead. Closes #1959.
+
+### Cluster-resolution decisions
+
+Three duplicate-PR clusters consolidated to one canonical PR each, with `Co-authored-by` attribution preserved on the merge commit:
+
+- **#1937 race** — three competing fixes filed within 24h: #1942 (synchronous mutex), #1949 (generation-token + mutex), #1962 (serialization + browser evidence). Selected #1949 as the canonical fix; the synchronous-mutex approach in #1942/#1962 doesn't reach into a prefetch's resolved callback once it's past the entry-gate. Browser evidence under `docs/pr-media/1937/` was not absorbed (the fix in stage covers what the evidence demonstrates).
+
+- **#1932 goal hook** — same-shape fixes in #1946 and #1951. Selected #1951 for the materially better test coverage (10 dedicated regression tests vs handful in #1946); both PRs ship the `goal_related` flag through `/api/chat/start` → streaming worker.
+
+- **Custom-provider dedup** — #1874 (broad scope including a behavior change to `_deduplicate_model_ids`) vs #1947 (4-LOC minimum-correct fix). Selected #1947; #1874's `_deduplicate_model_ids` change can be revisited as a separate PR if the underlying gap is real.
+
+### Stage-326 fixes applied per Opus advisor
+
+- **CRITICAL #1951 PENDING_GOAL_CONTINUATION race fix.** The original PR's `finally`-block discard at `api/streaming.py:3553` race-erased the marker before the frontend's SSE-receive → `POST /api/chat/start` round-trip could consume it. Removed the discard; the consumer in `routes.py` discards atomically on read. 5 new regression guards in `tests/test_stage326_pending_goal_continuation_race.py` pin the corrected ordering.
+
+- **#1956 composer-draft input validation.** Added size + type clamps (text 50 KB max str-coerce, files 50 entries max list-coerce) to the `POST /api/session/draft` handler. Without this, a misbehaving client could persist multi-MB strings into the session JSON via the 400 ms debounced auto-save. 5 new validation tests in `tests/test_stage326_composer_draft_validation.py`.
+
+- **#1957 SESSION_TTL constant preserved.** The original PR deleted the `SESSION_TTL = 86400 * 30` module constant; existing regression tests (`test_v050258_opus_followups::test_redirect_session_ttl_30_days`, `test_auth_sessions::test_session_ttl_is_24_hours`) pin it as a guard against the daily-kick-out regression from #1419. Restored as the named fallback for `_resolve_session_ttl()`. Reconciled the new `TestSessionTtlResolution` class to use unittest setUp/tearDown env snapshotting rather than the pytest `monkeypatch` fixture (incompatible with `unittest.TestCase` subclasses) and aligned clamp tests with the actual fall-through-to-default behavior.
+
+### Tests
+
+5006 → **5028 collected, 5028 passing, 0 regressions** (+51 net new across the 12 PRs + 10 stage-326 hardening tests). Full suite ~143 s on Python 3.11 (HERMES_HOME isolated). JS syntax check (`node -c`) clean on all 5 modified `static/*.js` files. Browser API sanity harness (port 8789): all 11 endpoints + 20 QA tests PASS. Manual live verification on stage-326 server (port 8789): composer-draft validation working (50 KB clamp, 50-entry files clamp, type coercion); session TTL resolution honors env var (3600 s) and falls through on out-of-range. Opus advisor: SHIP-WITH-FIXES (all required + recommended fixes applied in `404e24ac` + `8782fd26` stage commits).
+
+### Pre-release verification
+
+- Full pytest under `HERMES_HOME` isolation: **5028 passed, 8 skipped, 1 xfailed, 2 xpassed, 1 warning, 8 subtests passed** in 142.61 s.
+- Browser API harness against port 8789: all 11 endpoints + 20 QA tests PASS (111.19 s).
+- Manual live verification on stage-326 server (port 8789): composer-draft API + TTL resolution + custom-provider model groups all behave as expected.
+- `node -c` on all 5 modified `static/*.js` files: clean.
+- `py_compile` on all 6 modified `api/*.py` files: clean.
+- No leftover merge-conflict markers anywhere in the tree (companion `tests/test_pwa_manifest_sw.py` regression check + grep sweep).
+- Stage diff: 28 files, +1609/-116.
+- Opus advisor pass: VERDICT=SHIP-WITH-FIXES with all critical + recommended fixes now applied. Re-verified on the patched stage HEAD.
+- Pre-stamp re-fetch of all 12 PR heads: no contributor force-push during the build window.
+
+### Closed in favor of canonical PRs (with Co-authored-by attribution)
+
+- **#1942** (franksong2702 — synchronous mutex for #1937) → closed in favor of #1949
+- **#1962** (Michaelyklam — serialization + browser evidence for #1937) → closed in favor of #1949
+- **#1946** (franksong2702 — goal_related flag for #1932) → closed in favor of #1951
+- **#1874** (hacker1e7 — broader custom-provider dedup) → closed in favor of #1947's 4-LOC fix
+- **#1311** (lost9999 — codex cache invalidation; superseded on master)
+
+## [v0.51.30] — 2026-05-08 — 3-PR contributor batch (Release G: offline recovery + PWA hardening + opt-in session jump buttons + opt-in endless-scroll)
+
+### Added (3 PRs, all from @ai-ag2026)
+
+- **PR #1891** — Browser offline recovery and PWA cache hardening. Adds an offline/recovery banner that probes `/health` and auto-refreshes when Hermes is reachable again. Defers stream error handling while the browser is offline so reconnecting does not immediately surface a terminal chat error. Makes service-worker shell assets network-first with cache fallback (so local hotfixes are not hidden behind stale cached JS/CSS), while preserving offline-launch capability via `install` pre-caching of SHELL_ASSETS. Keeps PWA/native chrome colors aligned with the dark Hermes background. Stream-error deferral only triggers when the banner is visible OR `navigator.onLine===false` — so Hermes-up + browser-online flows errors through normally; no swallowed auth errors. Supersedes the recovery/PWA portion of #1888.
+
+- **PR #1928** — Opt-in session Start/End jump buttons (`session_jump_buttons` setting, default OFF). Adds an Appearance setting that surfaces a sticky `Start` pill (loads full history and jumps to beginning) and expands the existing scroll-to-bottom button into an `End` pill. Localized text, tooltip, and aria labels for the jump controls. The opt-in default keeps the existing UI unchanged for users who don't want the floating pills.
+
+- **PR #1929** — Opt-in session endless-scroll (`session_endless_scroll` setting, default OFF). Adds automatic prefetching of older transcript pages while scrolling upward (1.5x viewport prefetch window). Builds on #1927's viewport-preservation fix (shipped in v0.51.29) so prepended pages have scroll runway and don't jump. Replaces the previous auto-trigger-at-scrollTop<80 behavior — when the setting is OFF, users get the manual "Load earlier" button path (`_wireMessageWindowLoadEarlierButton`).
+
+### Conflict resolution applied during stage merge
+
+#1928 and #1929 both touch `static/ui.js`, `static/i18n.js`, `static/index.html`, `static/panels.js`, `api/config.py`. Mechanical conflicts (both add new settings keys / locale entries / HTML toggles / accessor branches) were resolved by keeping both — the features are independent opt-in toggles. The `static/ui.js` scroll-listener conflict required an intent-based resolution: #1929 INTENTIONALLY replaces the `el.scrollTop<80` auto-trigger block with the gated prefetch block, so the old block was removed. Test `tests/test_session_endless_scroll.py::test_scroll_listener_prefetches_older_messages_only_when_enabled` enforces this. CHANGELOG conflicts auto-resolved during rebase (took ours strategy).
+
+### Tests
+
+4960 → **4977 collected, 4977 passing, 0 regressions** (+17 net new). Full suite ~140s on Python 3.11 (HERMES_HOME isolated). JS syntax check (`node -c`) clean on all 6 modified `static/*.js` files. Browser API sanity harness (port 8789): all 11 endpoints + 20 QA tests PASS. **Manual browser verification on stage-325 server** (port 8789): both new settings toggles render in the Settings panel; `window._isSessionEndlessScrollEnabled()` correctly reflects toggle state; `_updateSessionStartJumpButton` function is exposed; offline-banner template + "Check now" button present in HTML. Opus advisor: SHIP-WITH-FIXES (one tracked race fast-follow + one i18n polish fast-follow, both non-blockers per Opus's own recommendation "Ship the batch").
+
+### Pre-release verification
+
+- Full pytest under `HERMES_HOME` isolation: **4977 passed, 8 skipped, 1 xfailed, 2 xpassed, 8 subtests passed** in 140.56s.
+- Browser API harness against stage-325 on port 8789: all 11 endpoints + 20 QA tests PASS (111.35s for QA phase).
+- Manual browser verification: stage-325 server up on 8789, navigated to /, verified new toggles render in Settings panel, verified helper functions exposed correctly, verified offline-banner template loaded.
+- `node -c` on all 6 modified `static/*.js` files: clean.
+- Stage diff: 16 files, +649/-30.
+- Opus advisor pass on stage-325 brief: VERDICT=SHIP-WITH-FIXES with explicit "Ship the batch" recommendation. Two fast-follows filed for tracking, neither is blocking.
+- v0.51.29 carry-overs verified preserved (no in-batch changes to `_strip_workspace_prefix`, `evaluate_goal_after_turn`, `_profiles_match`, `mcp_server.py`).
+- Pre-stamp re-fetch of all 3 PR heads: no contributor force-push during Opus window.
+
+### Follow-up items filed (non-blocking)
+
+- **Race between endless-scroll prefetch and Start-jump's `_ensureAllMessagesLoaded`** — with both opt-ins ON, an in-flight prefetch (started by 1.5x-viewport trigger) racing with `jumpToSessionStart` → `_ensureAllMessagesLoaded` could produce duplicate messages if the prefetch resolves last. Narrow window, but the fix is to gate `_ensureAllMessagesLoaded` on the existing `_loadingOlder` flag. **Resolved in Unreleased — see #1937 entry above; final fix uses generation-token + mutex rather than the originally-suggested flag gate, which would not have closed the race.**
+- **#1928 locale parity** — `session_jump_*` and `settings_*_session_jump_buttons` keys are English literals in ja/ru/es/de/zh/zh-Hant/pt/ko. Default-OFF + English fallback works, but breaks the locale-parity standard set by #1929 and #1891 in the same release.
+
+
+### Added (1 PR)
+
+- **PR #1919** by @franksong2702 — Persist login rate limit attempts (closes #1910). Stores failed-login buckets in `STATE_DIR/.login_attempts.json` instead of in-process memory, so password-auth deployments keep the same failed-attempt window across restarts. Atomic temp+rename writes, `0600` permissions, prunes expired entries on load. If the file is missing, malformed, or unwritable, the auth path falls back to current in-memory behavior with debug-level logging — no infinite-loop risk.
+
+### Fixed (5 PRs)
+
+- **PR #1920** by @franksong2702 — Remove dead `kanban_card_start` i18n key. PR #1886 removed the Kanban card-level Start action (direct `running` transitions are now owned by the dispatcher), but the `kanban_card_start` locale key was left present in every locale block. Removed across all 9 locales and strengthened the Kanban static regression test so the dead key cannot be reintroduced.
+
+- **PR #1921** by @Michaelyklam — Production Docker image hardening (closes #1908). Removes passwordless sudo path, drops the `hermeswebuitoo` sudo-capable staging user, and reworks `docker_init.bash` so privileged setup runs in an explicit root init block before re-execing as the `hermeswebui` user without sudo. Init scratch state now uses owner-only permissions (`umask 0077`, `0700` directory, `0600` files). Added `docs/docker.md` with production-image security model notes. A shell gained through the WebUI runtime no longer has a passwordless sudo path to root inside the production container.
+
+- **PR #1926** by @ai-ag2026 — Prevent chat scroll resets after final render. The final-render path could write/rebuild DOM, queue native scroll events, and then lose the explicit bottom pin before delayed layout growth settled. Separately, clicking the already-open session still ran the `loadSession()` teardown/setup path. Fix: keep explicit bottom scroll pins stable across `renderMessages({preserveScroll: true})` and late Markdown/layout growth, and make clicking the currently-active sidebar session a no-op before `loadSession()` mutates state.
+
+- **PR #1927** by @ai-ag2026 — Preserve viewport when loading older messages. Pre-fix, prepending older history could snap the viewport to the bottom or surface only a larger hidden-count marker. Fix: expand transcript render window before rendering newly fetched older messages, then anchor at the current viewport instead of snapping. Adds focused regression coverage for older-history viewport anchoring.
+
+- **PR #1930** by @ai-ag2026 — Collapse stale compression sidebar segments. The sidebar collapse key treated any row whose `parent_session_id` pointed at another visible row as a non-collapsible child/fork row — correct for subagent/fork sessions, but wrong for automatic compression continuations that already carry `_lineage_root_id`/`lineage_root_id` and should collapse by lineage even when stale optimistic parent segments are still locally visible. Fix: prefer explicit lineage metadata before the visible-parent guard.
+
+### Tests
+
+4947 → **4960 collected, 4960 passing, 0 regressions** (+13 net new). Full suite ~145s on Python 3.11 (HERMES_HOME isolated). JS syntax check (`node -c`) clean on `static/i18n.js`, `static/sessions.js`, `static/ui.js`. Browser API sanity harness (port 8789): all 11 endpoints + 20 QA tests PASS. Opus advisor pass: SHIP-READY (only flag was a #1919 CHANGELOG conflict already auto-resolved during stage rebase).
+
+### Pre-release verification
+
+- Full pytest under `HERMES_HOME` isolation: **4960 passed, 11 skipped, 1 xfailed, 2 xpassed, 8 subtests passed** in 145.24s.
+- Browser API harness against stage-324 on port 8789: all 11 endpoints + 20 QA tests PASS (110.90s for QA phase).
+- `node -c` on all 3 modified `static/*.js` files: clean.
+- Stage diff: 18 files, +588/-150.
+- Opus advisor pass on stage-324 brief: VERDICT=SHIP-WITH-FIXES (single fix: #1919 CHANGELOG rebase — already auto-resolved during stage merge). Coexistence verified for #1926/#1927/#1930 sharing `static/sessions.js` (different functions, scroll-pin and viewport-anchor cannot fight; lineage metadata degrades gracefully on legacy sessions).
+- v0.51.28 carry-overs verified preserved (no in-batch changes to `api/routes.py:_strip_workspace_prefix`, `api/streaming.py:evaluate_goal_after_turn`, `api/profiles.py:_profiles_match`, `tests/test_mcp_server.py` module-restoration logic).
+- Pre-stamp re-fetch of all 6 PR heads: no contributor force-push during Opus window.
+
+
+### Added (2 PRs)
+
+- **PR #1895** by @samuelgudi — MCP server Option A rewrite (#1616). Replaces the fragile MCP integration with a clean `mcp_server.py` (567 LOC) implementing project CRUD, session listing, and session mutations (rename/move) over Hermes's HTTP API. Imports `api.models` / `api.profiles` canonically rather than carrying duplicate slug-matching helpers. Relocates `_profiles_match` from `api/routes.py` into `api/profiles.py` as the single source of truth (mcp_server.py and api/routes.py both now import the canonical helper — re-introducing a local copy in either module trips a parity test immediately). Adds env-aware WEBUI_URL (`HERMES_WEBUI_HOST` / `HERMES_WEBUI_PORT`). New behaviour: `delete_project` REFUSES to touch session JSONs when `HERMES_WEBUI_PASSWORD` is unset, returning `{ok:true, unassigned_sessions:0, warning:"…"}` instead — preventing data-loss when an MCP client tries to delete a project on an unauthenticated server. 53-test coverage in `tests/test_mcp_server.py` (914 LOC) including HTTP wire-format integration tests, profile-scoped isolation, legacy untagged row visibility, and `--profile foo` CLI ordering regression. Closes #1616.
+
+- **PR #1866** by @Michaelyklam — WebUI `/goal` command for goal-tracking with budget enforcement and continuation prompts. New `api/goals.py` (489 LOC) implements goal lifecycle (set / pause / resume / clear / status), per-profile SQLite `SessionDB` cache, and `evaluate_goal_after_turn()` SSE hook that emits `goal` and `goal_continue` events from `api/streaming.py` after assistant turns. Wire-up: `api/routes.py` adds `/api/goal` endpoint (POST set/pause/resume/clear, GET status) and `_start_chat_stream_for_session()` extraction so kickoff prompts can run through the canonical streaming path; `static/commands.js` adds `/goal` autocomplete (cmdGoal handler) with i18n description; `static/messages.js` handles new SSE event types with continuation-toast UI; `static/i18n.js` adds 9 new strings across all locales. 4 documentation screenshots added under `docs/pr-media/{1866,1808}/`. Closes #1808.
+
+### Mid-stage absorbed fixes (test isolation, per blocker investigation)
+
+- **#1857 polluter root-cause** — `tests/test_issue1857_usage_overwrite.py` was using `mock.patch.dict(sys.modules, {...})`, which DELETES any keys added during the patched scope on `__exit__`. That silently evicted lazily-imported pydantic submodules (e.g. `pydantic.root_model`), producing `KeyError: 'pydantic.root_model'` in `test_mcp_server.py` downstream when the full pytest suite ran. Fixed by replacing with manual save/restore using a `_MISSING` sentinel.
+- **#1895 module-attribute restoration** — `tests/test_mcp_server.py` mutates module-level constants on `api.config`/`api.models`/`mcp_server` (`STATE_DIR`, `SESSION_DIR`, `PROJECTS_FILE`, …) so the MCP server reads from a tmpdir. Without restoration, downstream tests (`test_pytest_state_isolation`, `test_provider_quota_status`, `test_provider_management`) read deleted tmpdirs from `api.config.STATE_DIR`. Fixed by snapshotting originals on first `_reimport_mcp()` call and restoring in `_cleanup_state_dir()`.
+- **#1895 `_profiles_match` parity test parent-attribute leak** — `test_profiles_match_single_source_of_truth` pops `api.routes`/`api.profiles` from `sys.modules` and re-imports for the canonical-helper identity check. When restoring `sys.modules` only, fresh modules still leaked through because `import api.routes as r` resolves via `sys.modules['api'].routes` (parent-package attribute), NOT via `sys.modules['api.routes']` directly. Fixed by ALSO restoring parent-package attributes — without this, sibling tests (`test_plugins_panel`, `test_pr1350_sse_notify_correctness`, `test_version_badge`) that patch `api.routes.j` and call handlers via `import api.routes as routes` would fail because the patch hits one module object and the handler reads from another.
+
+### Tests
+
+4898 → **4947 collected, 4947 passing, 0 regressions** (+49 net new). Full suite ~140s on Python 3.11 (HERMES_HOME isolated). JS syntax check (`node -c`) clean on `static/commands.js`, `static/i18n.js`, `static/messages.js`. Browser API sanity harness (port 8789): all 11 endpoints + 20 QA tests PASS. Opus advisor pass: SHIP-READY, no blockers (2 follow-up items filed: goal hook firing on unrelated turns; English-only runtime strings in goal UI).
+
+### Pre-release verification
+
+- Full pytest under `HERMES_HOME` isolation: **4947 passed, 8 skipped, 1 xfailed, 2 xpassed, 8 subtests passed** in 140.41s.
+- Browser API harness against stage-323 on port 8789: all 11 endpoints + 20 QA tests PASS (110.66s for QA phase).
+- `node -c` on all 3 modified `static/*.js` files: clean.
+- Stage diff: 16 files, +2692/-105.
+- Opus advisor pass on stage-323 brief: VERDICT=SHIP-READY. No coexistence bugs between #1895 and #1866 (disjoint hunks in routes.py, SSE event names align, `_profiles_match` resolution unambiguous either way, no path collisions).
+- v0.51.27 fixes verified preserved: `_strip_workspace_prefix` (callers at routes.py:1446/1485), `on_interim_assistant` (streaming.py:2120), `_max_iterations_cfg` (streaming.py:2331-2410), `if input_tokens > 0:` guard (streaming.py:2933).
+- Pre-stamp re-fetch of #1866 (sha f2aacf4) + #1895 (sha 766c91e): both MERGEABLE, no force-push during Opus window.
+
+### Follow-up items (filed for next sweep)
+
+- **Goal hook fires on unrelated turns** — while a goal is `active`, every completed assistant turn runs `evaluate_goal_after_turn` and ticks `state.turns_used += 1`, even on user messages unrelated to the goal. UX surprise but not bug-broken; consider gating on `user_initiated` or a goal-context flag.
+- **English-only runtime strings in goal UI** — `messages.js:889` ("Evaluating goal progress…"), `commands.js:651` ("Working toward goal…"), `messages.js:914` ("Continuing toward goal…" toast); also backend strings in `goals.py` (`status_line`, "⊙ Goal set …", "⏸ Goal paused …", "↻ Continuing …"). The `cmd_goal` autocomplete description IS localized across all 9 locales — only the runtime status strings are missed.
+
+
+### Fixed (4 PRs)
+
+- **PR #1916** by @Michaelyklam — Make Kanban detail view scrollable. The app shell sets `body { overflow: hidden }`, so the Kanban main view must own vertical scrolling. Pre-fix, a selected task with a long body could push the board below the viewport with no way to reach it. Fix: add `overflow-y: auto` to `main.main.showing-kanban > #mainKanban` (one CSS property + regression test). Closes #1915.
+
+- **PR #1914** by @ai-ag2026 — Keep streaming chat pinned after final render. During streaming, bottom-pinned scroll worked, but after the `done` event late Markdown layout growth could unpin the viewport — the user would see the last token, then suddenly the chat would scroll up by hundreds of pixels as render reflowed. Fix: add explicit upward-intent gating (`MESSAGE_UPWARD_INTENT_MS=450` ms window for wheel/touch events) so passive `scrollTop` decreases from windowing/reflow no longer count as user upward intent. Pre-replacement `shouldFollowOnDone` capture in `static/messages.js` calls `scrollToBottom()` if pin or near-bottom (`<=1200px`) was true before render. `scrollIfPinned` and `scrollToBottom` now write `_lastScrollTop` and clear the programmatic flag in a rAF so the next listener pass doesn't see a synthetic upward delta.
+
+- **PR #1918** by @franksong2702 — Fix workspace prefix sentinel handling (closes #1913 follow-up filed in v0.51.25). The pre-fix strip regex `^\s*\[Workspace:[^\]]+\]\s*` was too permissive — a user prompt starting with `[Workspace: /path/to/explain]` would be silently eaten, and workspace paths containing `]` would truncate at the first `]`. Fix introduces a versioned sentinel format `[Workspace::v1: ...]` (double-colon distinguishes from natural English) AND escapes `]` in the path with `\]`. New helpers: `_workspace_context_prefix(path)`, `_escape_workspace_prefix_path(path)`, and `_strip_workspace_prefix(text, *, include_legacy=False)` with optional legacy fallback for transcript-compaction identity matching during the migration window. Closes #1913.
+
+  **Mid-stage absorbed fixes (per Opus advisor on stage-322):**
+  1. **#1918 missed second injection site at `api/routes.py:6689`** (`_handle_chat_sync`, the `POST /api/chat` synchronous handler). Without this fix, the sync chat path would still inject legacy `[Workspace: ...]` while the streaming path injected `[Workspace::v1: ...]` — producing user bubbles that visibly leak the prefix on the sync surface, and a system-prompt format string that no longer matches reality. Maintainer routed the sync injection through `_workspace_context_prefix(...)` and updated the surrounding system-prompt text to v1 form, mirroring the streaming.py block.
+  2. **#1918 backwards-compat gap in `static/ui.js:_stripWorkspaceDisplayPrefix`** — existing on-disk transcripts saved before the v1 migration still carry the legacy format. Without a JS legacy fallback, pre-upgrade sessions would render the literal `[Workspace: /tmp/proj]` prefix in user bubbles after upgrade. Maintainer added a legacy-regex fallback paralleling the Python `include_legacy=True` branch on the streaming side; updated the regression test that previously asserted the legacy regex was absent.
+
+- **PR #1814** by @hualong1009 — Custom named provider API key resolution. Adds new top-level helper `resolve_custom_provider_connection(provider_id) -> (api_key, base_url)` that resolves `custom:*` provider IDs to credentials from `config.yaml > custom_providers[]`. Supports `api_key` as literal value, `${ENV_VAR}` interpolation, or `key_env` env-var hint. Uses `get_config()` snapshot (per-profile aware). Fallback to single-entry `custom_providers` when slug doesn't match exactly. Also adds fallback in `api/streaming.py` self-heal paths so an agent rebuild after a transient failure can re-fetch credentials. **Deferral re-evaluated (per prior sweep notes):** the prior `maintainer-review` flag noted feared overlap with #1818, but #1818 already shipped (v0.51.19) with its slug-matching helpers. Re-checking against current master post-#1818: the new `resolve_custom_provider_connection()` is purely additive (no helper duplication). **Style observation (non-blocking)**: PR's local `_slugify` has slightly different normalization (`_` → `-`, collapse `--`, strip leading/trailing `-`) than master's canonical `_custom_provider_slug_from_name`. Internally self-consistent (both pid and entry name go through the same local slugify before comparison) so it works for matching, but a follow-up could unify the slug semantics. The 6-call-site fallback pattern (3 in `api/routes.py`, 3 in `api/streaming.py`) is also a candidate for a single `apply_custom_provider_fallback()` helper.
+
+### Tests
+
+4890 → **4898 collected, 4884 passing, 0 regressions** (+8 net new). Full suite ~145s on Python 3.11 (HERMES_HOME isolated). JS syntax check (`node -c`) passes on `static/messages.js` and `static/ui.js`. Browser API sanity harness (port 8789) all-green: 11 endpoints + 20 QA tests verified. Opus advisor pass: 2 BLOCKERS identified and fixed in-stage (per absorb-in-release default), then SHIP.
+
+### Pre-release verification
+
+- Full pytest under `HERMES_HOME` isolation: **4884 passed, 11 skipped, 1 xfailed, 2 xpassed, 8 subtests passed** in 145.18s.
+- Browser API harness against stage-322 on port 8789: all 11 endpoints + 20 QA tests PASS.
+- `node -c` on `static/messages.js`, `static/ui.js`: clean.
+- Stage diff: 13 files, +348/-22 (pre-Opus-fix); 14 files, +382/-31 (post-Opus-fix incorporating the routes.py legacy-injection fix and ui.js legacy-fallback fix).
+- Opus advisor pass on stage-322 brief: identified 2 BLOCKERS in PR #1918 (missed `routes.py` injection site + missing JS legacy fallback). Both absorbed in-stage per absorb-in-release default. Test that asserted "legacy regex absent" updated to assert legacy regex IS present (mirrors Python `include_legacy=True` branch).
+- v0.51.26 fixes verified preserved across rebase: `_strip_workspace_prefix` (10), `on_interim_assistant` (2), `_max_iterations_cfg` (9), `if input_tokens > 0:` (1), `get_default_hermes_root` (3), `_sessionSegmentCount` (9), `_active_skills_dir` (6).
+- Pre-stamp re-fetch of all 4 PR heads: no contributor force-pushes during the Opus window.
+
+### Opus-applied fixes (absorbed in-release)
+
+**From stage-322 absorption:**
+
+1. **#1918 second injection site** — `api/routes.py:_handle_chat_sync` was injecting legacy `[Workspace: ...]` and telling the agent that's the active format. Fixed: routed through `_workspace_context_prefix(str(s.workspace))`; updated surrounding system-prompt strings to reference `[Workspace::v1: ...]` consistently.
+
+2. **#1918 JS legacy fallback** — `static/ui.js:_stripWorkspaceDisplayPrefix` was changed to v1-only regex with no legacy fallback. Fixed: added fallthrough to legacy regex when v1 strip doesn't match, mirroring the Python `include_legacy=True` branch. Updated test `test_workspace_display_prefix_helper_strips_leading_metadata_only` to assert the legacy regex IS present (was inverted to assert it was absent).
+
 ## [v0.51.26] — 2026-05-08 — 5-PR follow-on contributor batch (Release D: profile-isolation hardening across cache + skills + gateway-health, context-length config-override threading, sidebar segment count UI polish)
 
 ### Fixed (5 PRs + 1 absorbed test)

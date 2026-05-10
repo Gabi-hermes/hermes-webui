@@ -1430,6 +1430,44 @@ def _base_url_points_at_local_server(base_url: str) -> bool:
         return False
 
 
+def _custom_slug_rest_looks_like_host_port(rest: str) -> bool:
+    """True when ``custom:<rest>`` is an endpoint-style slug ``host:port``.
+
+    WebUI sometimes derives ``custom:10.8.71.41:8080`` from ``base_url`` authority.
+    The #1776 peel must not treat that middle colon as part of an eaten model
+    segment — otherwise ``@custom:10.8.71.41:8080:Qwen3`` wrongly becomes model
+    ``8080:Qwen3``.
+    """
+    rest = str(rest or "").strip()
+    if ":" not in rest:
+        return False
+    host, port_s = rest.rsplit(":", 1)
+    if not host or ":" in host:
+        return False
+    if not port_s.isdigit():
+        return False
+    try:
+        port_n = int(port_s)
+    except ValueError:
+        return False
+    if not (1 <= port_n <= 65535):
+        return False
+    try:
+        import ipaddress
+
+        ipaddress.ip_address(host)
+        return True
+    except ValueError:
+        pass
+    hl = host.lower()
+    if hl == "localhost":
+        return True
+    # Typical DNS hostname used as proxy slug (contains at least one label dot).
+    if "." in host:
+        return True
+    return False
+
+
 def resolve_model_provider(model_id: str) -> tuple:
     """Resolve model name, provider, and base_url for AIAgent.
 
@@ -1516,15 +1554,20 @@ def resolve_model_provider(model_id: str) -> tuple:
     # ("@custom:my-key:some-model:free"), rsplit yields
     # provider_hint="custom:my-key:some-model", bare_model="free", and the
     # custom-prefix guard below skips the split-fallback. Detect the
-    # over-split structurally — custom hints carry exactly one segment after
-    # "custom:", so any provider_hint with 2+ colons that starts with
-    # "custom:" has eaten part of the model name. Peel one segment back.
+    # over-split structurally — custom hints normally carry one slug segment
+    # after ``custom:``. If ``provider_hint`` has extra ``:`` tokens because the
+    # model ID contained tags like ``:free``, peel one segment back (#1776).
+    #
+    # Exception: ``custom:<ip-or-host>:<port>`` is a single logical slug derived
+    # from OpenAI ``base_url`` authority and contains no eaten model segments.
     if model_id.startswith("@") and ":" in model_id:
         inner = model_id[1:]
         provider_hint, bare_model = inner.rsplit(":", 1)
         if provider_hint.startswith("custom:") and provider_hint.count(":") >= 2:
-            provider_hint, extra = provider_hint.rsplit(":", 1)
-            bare_model = f"{extra}:{bare_model}"
+            _slug_rest = provider_hint[len("custom:"):]
+            if not _custom_slug_rest_looks_like_host_port(_slug_rest):
+                provider_hint, extra = provider_hint.rsplit(":", 1)
+                bare_model = f"{extra}:{bare_model}"
         elif (provider_hint not in _PROVIDER_MODELS
                 and provider_hint not in _PROVIDER_DISPLAY
                 and not provider_hint.startswith("custom:")):
@@ -1594,6 +1637,102 @@ def resolve_model_provider(model_id: str) -> tuple:
             return model_id, "openrouter", None
 
     return model_id, config_provider, config_base_url
+
+
+def resolve_custom_provider_connection(provider_id: str) -> tuple[str | None, str | None]:
+    """Return (api_key, base_url) for a named ``custom:*`` provider.
+
+    Supports ``custom_providers[].api_key`` as either a literal key or
+    ``${ENV_VAR}``, and ``custom_providers[].key_env`` as an env-var hint.
+    Returns ``(None, None)`` when no named custom provider matches.
+    """
+    pid = str(provider_id or "").strip().lower()
+    if not pid.startswith("custom:"):
+        return None, None
+
+    def _slugify(value: str) -> str:
+        s = str(value or "").strip().lower().replace("_", "-").replace(" ", "-")
+        while "--" in s:
+            s = s.replace("--", "-")
+        return s.strip("-")
+
+    slug = _slugify(pid.split(":", 1)[1].strip())
+    if not slug:
+        return None, None
+
+    # Read the live config snapshot to avoid stale module-level cache edge
+    # cases after profile switches or runtime config edits.
+    cfg_data = get_config()
+
+    def _resolve_key(raw_api_key, raw_key_env) -> str | None:
+        api_key = None
+        if raw_api_key is not None:
+            key_text = str(raw_api_key).strip()
+            if key_text.startswith("${") and key_text.endswith("}") and len(key_text) > 3:
+                api_key = os.getenv(key_text[2:-1], "").strip() or None
+            elif key_text:
+                api_key = key_text
+        if not api_key:
+            key_env = str(raw_key_env or "").strip()
+            if key_env:
+                api_key = os.getenv(key_env, "").strip() or None
+        return api_key
+
+    custom_providers = cfg_data.get("custom_providers", [])
+    if not isinstance(custom_providers, list):
+        custom_providers = []
+
+    for entry in custom_providers:
+        if not isinstance(entry, dict):
+            continue
+        name = str(entry.get("name") or "").strip()
+        if not name:
+            continue
+        entry_slug = _slugify(name)
+        if entry_slug != slug:
+            continue
+
+        base_url = str(entry.get("base_url") or "").strip() or None
+        api_key = _resolve_key(entry.get("api_key"), entry.get("key_env"))
+        return api_key, base_url
+
+    # If exactly one custom provider is configured, use it as a pragmatic
+    # fallback for mismatched slugs (e.g. punctuation differences).
+    if len(custom_providers) == 1 and isinstance(custom_providers[0], dict):
+        entry = custom_providers[0]
+        return (
+            _resolve_key(entry.get("api_key"), entry.get("key_env")),
+            str(entry.get("base_url") or "").strip() or None,
+        )
+
+    # Fallbacks for setups that don't use custom_providers names directly.
+    providers_cfg = cfg_data.get("providers", {})
+    provider_specific = providers_cfg.get(pid, {}) if isinstance(providers_cfg, dict) else {}
+    provider_custom = providers_cfg.get("custom", {}) if isinstance(providers_cfg, dict) else {}
+
+    model_cfg = cfg_data.get("model", {})
+    model_provider = str(model_cfg.get("provider") or "").strip().lower() if isinstance(model_cfg, dict) else ""
+
+    fallback_base = None
+    for candidate in (provider_specific, provider_custom, model_cfg):
+        if isinstance(candidate, dict):
+            _base = str(candidate.get("base_url") or "").strip()
+            if _base:
+                fallback_base = _base
+                break
+
+    fallback_key = None
+    if isinstance(provider_specific, dict):
+        fallback_key = _resolve_key(provider_specific.get("api_key"), provider_specific.get("key_env"))
+    if not fallback_key and isinstance(provider_custom, dict):
+        fallback_key = _resolve_key(provider_custom.get("api_key"), provider_custom.get("key_env"))
+    if not fallback_key and isinstance(model_cfg, dict) and model_provider in {"custom", pid, slug}:
+        fallback_key = _resolve_key(model_cfg.get("api_key"), model_cfg.get("key_env"))
+
+    if fallback_key or fallback_base:
+        return fallback_key, fallback_base or None
+
+    return None, None
 
 
 def model_with_provider_context(model_id: str, model_provider: str | None = None) -> str:
@@ -2853,7 +2992,7 @@ def get_available_models() -> dict:
         _custom_providers_cfg = cfg.get("custom_providers", [])
         _named_custom_groups: dict = {}
         if isinstance(_custom_providers_cfg, list):
-            _seen_custom_ids = {m["id"] for m in auto_detected_models}
+            _seen_custom_ids = set()
             for _cp in _custom_providers_cfg:
                 if not isinstance(_cp, dict):
                     continue
@@ -2874,9 +3013,10 @@ def get_available_models() -> dict:
                             _cp_model_ids.append(_m_id.strip())
 
                 for _cp_model in _cp_model_ids:
-                    if _cp_model and _cp_model not in _seen_custom_ids:
+                    _dedup_key = f"{_slug}:{_cp_model}" if _slug else _cp_model
+                    if _cp_model and _dedup_key not in _seen_custom_ids:
                         _cp_label = _get_label_for_model(_cp_model, [])
-                        _seen_custom_ids.add(_cp_model)
+                        _seen_custom_ids.add(_dedup_key)
                         if _slug:
                             detected_providers.add(_slug)
                             _cp_option_id = _cp_model
@@ -3510,6 +3650,8 @@ AGENT_INSTANCES: dict = {}  # stream_id -> AIAgent instance for interrupt propag
 STREAM_PARTIAL_TEXT: dict = {}  # stream_id -> partial assistant text accumulated during streaming
 STREAM_REASONING_TEXT: dict = {}  # stream_id -> reasoning trace accumulated during streaming (#1361 §A)
 STREAM_LIVE_TOOL_CALLS: dict = {}  # stream_id -> live tool calls accumulated during streaming (#1361 §B)
+STREAM_GOAL_RELATED: dict = {}  # stream_id -> bool: only evaluate goal for goal-related turns (#1932)
+PENDING_GOAL_CONTINUATION: set = set()  # session_ids awaiting a goal continuation turn (#1932)
 SERVER_START_TIME = time.time()
 
 # Agent cache: reuse AIAgent across messages in the same WebUI session so that
@@ -3586,6 +3728,8 @@ _SETTINGS_DEFAULTS = {
     "theme": "dark",  # light | dark | system
     "skin": "default",  # accent color skin: default | ares | mono | slate | poseidon | sisyphus | charizard
     "font_size": "default",  # small | default | large
+    "session_jump_buttons": False,  # show Start/End transcript jump pills
+    "session_endless_scroll": False,  # auto-load older transcript pages while scrolling upward
     "language": "en",  # UI locale code; must match a key in static/i18n.js LOCALES
     "bot_name": os.getenv(
         "HERMES_WEBUI_BOT_NAME", "Hermes"
@@ -3714,6 +3858,8 @@ _SETTINGS_BOOL_KEYS = {
     "show_thinking",
     "simplified_tool_calling",
     "api_redact_enabled",
+    "session_jump_buttons",
+    "session_endless_scroll",
 }
 # Language codes are validated as short alphanumeric BCP-47-like tags (e.g. 'en', 'zh', 'fr')
 _SETTINGS_LANG_RE = __import__("re").compile(r"^[a-zA-Z]{2,10}(-[a-zA-Z0-9]{2,8})?$")
