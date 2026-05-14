@@ -45,7 +45,7 @@ def _security_headers(handler):
         "default-src 'self' https://*.cloudflareaccess.com; "
         "script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net https://static.cloudflareinsights.com; "
         "style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net https://fonts.googleapis.com; "
-        "img-src 'self' data: https: blob:; font-src 'self' data: https://cdn.jsdelivr.net https://fonts.gstatic.com; connect-src 'self'; "
+        "img-src 'self' data: https: blob:; font-src 'self' data: https://cdn.jsdelivr.net https://fonts.gstatic.com; connect-src 'self' http://192.168.18.6:8766; "
         "manifest-src 'self' https://*.cloudflareaccess.com; "
         "base-uri 'self'; form-action 'self'"
     )
